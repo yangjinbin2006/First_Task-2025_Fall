@@ -1,0 +1,303 @@
+# 创建文件：bpe_final_train.py
+import collections
+import re
+import random
+from tqdm import tqdm
+import time
+import pickle
+import os
+
+print("=== BPE 分词器训练 ===")
+
+
+class BPETokenizer:
+    def __init__(self):
+        self.merges = {}
+        self.vocab = set()
+
+    def get_stats(self, vocab):
+        """计算相邻符号对的频率"""
+        pairs = collections.defaultdict(int)
+        for word, freq in vocab.items():
+            symbols = word.split()
+            for i in range(len(symbols) - 1):
+                pairs[symbols[i], symbols[i + 1]] += freq
+        return pairs
+
+    def merge_vocab(self, pair, v_in):
+        """合并最频繁的符号对"""
+        v_out = {}
+        bigram = ' '.join(pair)
+        replacement = ''.join(pair)
+        pattern = re.compile(r'(?<!\S)' + re.escape(bigram) + r'(?!\S)')
+
+        for word in v_in:
+            w_out = pattern.sub(replacement, word)
+            v_out[w_out] = v_in[word]
+        return v_out
+
+    def train(self, text, vocab_size=10000, show_progress=True):
+        """训练 BPE 分词器"""
+        print("预处理文本...")
+        start_preprocess = time.time()
+
+        # 转换为小写并分词
+        text = text.lower()
+        words = text.split()
+
+        # 初始化词汇表
+        vocab = collections.Counter([f"{' '.join(list(word))} </w>" for word in words])
+        initial_vocab_size = len(set(' '.join(vocab.keys()).split()))
+
+        preprocess_time = time.time() - start_preprocess
+
+        print(f"单词数量: {len(words):,}")
+        print(f"初始词汇表大小: {initial_vocab_size}")
+        print(f"预处理时间: {preprocess_time:.2f} 秒")
+
+        self.merges = {}
+        current_vocab_size = initial_vocab_size
+
+        print(f"\n开始 BPE 训练，目标词汇量: {vocab_size}")
+        start_time = time.time()
+
+        # 使用 tqdm 显示进度
+        pbar = tqdm(total=vocab_size - initial_vocab_size,
+                    desc="训练进度",
+                    unit="merge",
+                    ncols=100) if show_progress else None
+
+        merge_count = 0
+        while current_vocab_size < vocab_size:
+            pairs = self.get_stats(vocab)
+            if not pairs:
+                print("\n没有更多可合并的对")
+                break
+
+            best_pair = max(pairs, key=pairs.get)
+            best_freq = pairs[best_pair]
+
+            if best_freq < 2:
+                print("\n最常见对频率 < 2")
+                break
+
+            # 执行合并
+            vocab = self.merge_vocab(best_pair, vocab)
+            self.merges[best_pair] = best_pair[0] + best_pair[1]
+            merge_count += 1
+
+            # 更新词汇表大小
+            current_vocab = set()
+            for word in vocab.keys():
+                current_vocab.update(word.split())
+            current_vocab_size = len(current_vocab)
+
+            if pbar:
+                pbar.update(1)
+                pbar.set_postfix({
+                    '词汇量': current_vocab_size,
+                    '合并': f"{best_pair[0]}{best_pair[1]}",
+                    '频率': best_freq
+                })
+
+            # 每 500 次合并显示一次信息
+            if merge_count % 500 == 0:
+                elapsed = time.time() - start_time
+                print(f"\n[检查点] 合并 {merge_count}, 词汇量 {current_vocab_size}, 用时 {elapsed:.1f}s")
+
+        if pbar:
+            pbar.close()
+
+        # 构建最终词汇表
+        self.vocab = set()
+        for word in vocab.keys():
+            self.vocab.update(word.split())
+
+        training_time = time.time() - start_time
+        print(f"\n🎉 训练完成!")
+        print(f"📊 最终词汇表大小: {len(self.vocab)}")
+        print(f"🔄 合并次数: {len(self.merges)}")
+        print(f"⏱️ 总训练时间: {training_time:.2f} 秒")
+        print(f"🚀 训练速度: {merge_count / training_time:.1f} 合并/秒")
+
+        return self
+
+    def encode_word(self, word):
+        """编码单个单词"""
+        tokens = list(word) + ['</w>']
+
+        changed = True
+        while changed and len(tokens) > 1:
+            changed = False
+            # 按长度排序，优先合并长的token
+            sorted_merges = sorted(self.merges.items(),
+                                   key=lambda x: -len(x[0][0] + x[0][1]))
+
+            for (pair, merge_result) in sorted_merges:
+                i = 0
+                while i < len(tokens) - 1:
+                    if tokens[i] == pair[0] and tokens[i + 1] == pair[1]:
+                        tokens = tokens[:i] + [merge_result] + tokens[i + 2:]
+                        changed = True
+                    else:
+                        i += 1
+                if changed:
+                    break
+        return tokens
+
+    def encode(self, text):
+        """编码文本"""
+        words = text.lower().split()
+        tokens = []
+        for word in words:
+            tokens.extend(self.encode_word(word))
+        return tokens
+
+    def decode(self, tokens):
+        """解码 tokens"""
+        text = ''.join(tokens)
+        text = text.replace('</w>', ' ')
+        return text.strip()
+
+    def analyze_vocab(self):
+        """分析词汇表"""
+        vocab_sizes = {}
+        for token in self.vocab:
+            length = len(token)
+            vocab_sizes[length] = vocab_sizes.get(length, 0) + 1
+
+        print(f"\n📈 词汇表分析:")
+        for length in sorted(vocab_sizes.keys()):
+            count = vocab_sizes[length]
+            percentage = (count / len(self.vocab)) * 100
+            print(f"  长度 {length}: {count:4d} tokens ({percentage:5.1f}%)")
+
+        # 显示一些常见的多字符token
+        multi_char = [t for t in self.vocab if len(t) > 1 and t != '</w>']
+        common_tokens = sorted(multi_char, key=len, reverse=True)[:15]
+        print(f"  🔤 常见多字符token: {common_tokens}")
+
+
+def load_data():
+    """加载数据"""
+    file_path = "/root/autodl-tmp/TinyStoriesV2-GPT4-valid.txt"
+
+    if not os.path.exists(file_path):
+        print(f"❌ 文件不存在: {file_path}")
+        print("请先完成下载")
+        return None
+
+    print(f"📁 加载数据文件: {file_path}")
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    print(f"📊 数据统计:")
+    print(f"  - 总字符数: {len(content):,}")
+    print(f"  - 总行数: {content.count(chr(10)) + 1:,}")
+
+    # 显示数据预览
+    lines = content.split('\n')
+    print(f"  - 数据预览:")
+    for i in range(min(3, len(lines))):
+        print(f"    {lines[i][:80]}...")
+
+    return content
+
+
+def sample_documents(text, num_docs=10):
+    """抽样文档"""
+    documents = text.split('\n\n')
+    documents = [doc.strip() for doc in documents if len(doc.strip()) > 100]
+
+    print(f"\n📄 文档统计:")
+    print(f"  - 找到 {len(documents)} 个文档")
+    print(f"  - 平均文档长度: {sum(len(doc) for doc in documents) / len(documents):.0f} 字符")
+
+    sampled = random.sample(documents, min(num_docs, len(documents)))
+    print(f"  - 抽样 {len(sampled)} 个文档用于测试")
+
+    return sampled
+
+
+def calculate_compression(tokenizer, documents):
+    """计算压缩率"""
+    print(f"\n🧮 计算压缩率...")
+    results = []
+
+    for i, doc in enumerate(documents):
+        original_chars = len(doc)
+        tokens = tokenizer.encode(doc)
+        num_tokens = len(tokens)
+        compression_ratio = original_chars / num_tokens
+
+        print(f"  文档 {i + 1:2d}: {original_chars:5d} 字符 → {num_tokens:4d} tokens "
+              f"(压缩率: {compression_ratio:.2f} 字节/token)")
+
+        # 显示第一个文档的编码示例
+        if i == 0:
+            print(f"     编码示例: {tokens[:20]}...")
+
+        results.append({
+            'original_chars': original_chars,
+            'num_tokens': num_tokens,
+            'compression_ratio': compression_ratio
+        })
+
+    return results
+
+
+def main():
+    # 加载数据
+    text = load_data()
+    if text is None:
+        return
+
+    # 抽样文档
+    documents = sample_documents(text, 10)
+
+    # 训练分词器
+    print(f"\n🔧 开始训练 10K 词汇量的 BPE 分词器...")
+    tokenizer = BPETokenizer()
+    tokenizer.train(text, vocab_size=10000)
+
+    # 分析词汇表
+    tokenizer.analyze_vocab()
+
+    # 计算压缩率
+    results = calculate_compression(tokenizer, documents)
+
+    # 统计分析
+    total_chars = sum(r['original_chars'] for r in results)
+    total_tokens = sum(r['num_tokens'] for r in results)
+    avg_compression = total_chars / total_tokens
+
+    print(f"\n📈 === 最终结果 ===")
+    print(f"  📝 总字符数: {total_chars:,}")
+    print(f"  🔤 总 Token 数: {total_tokens:,}")
+    print(f"  📦 平均压缩率: {avg_compression:.2f} 字节/token")
+    print(f"  📉 Token 减少比例: {(1 - total_tokens / total_chars) * 100:.1f}%")
+
+    # 保存模型
+    model_path = 'bpe_10k_tinystories.pkl'
+    with open(model_path, 'wb') as f:
+        pickle.dump({
+            'merges': tokenizer.merges,
+            'vocab': tokenizer.vocab,
+            'compression_ratio': avg_compression,
+            'vocab_size': len(tokenizer.vocab)
+        }, f)
+    print(f"\n💾 模型已保存为 '{model_path}'")
+
+    # 测试编解码
+    print(f"\n🔍 编解码测试:")
+    test_text = "The quick brown fox jumps over the lazy dog."
+    tokens = tokenizer.encode(test_text)
+    decoded = tokenizer.decode(tokens)
+    print(f"  原文: '{test_text}'")
+    print(f"  Tokens: {tokens}")
+    print(f"  解码: '{decoded}'")
+    print(f"  ✓ 编解码一致: {decoded == test_text.lower()}")
+
+
+if __name__ == "__main__":
+    main()
