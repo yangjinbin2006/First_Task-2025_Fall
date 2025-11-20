@@ -1,0 +1,382 @@
+# problem_3_4_fixed.py
+import re
+import collections
+from typing import Dict, List, Tuple
+import time
+import psutil
+import os
+import cProfile
+import pstats
+
+
+class BPETrainer:
+    def __init__(self):
+        # 使用兼容的正则表达式模式（不使用 \p{} 语法）
+        self.PAT = r"""'(?:[sdmt]|ll|ve|re)| ?[a-zA-Z]+| ?[0-9]+| ?[^\sa-zA-Z0-9]+|\s+(?!\S)|\s+"""
+        # 简化版本：字母、数字、非字母数字字符、空格
+
+    def train_bpe(self, input_path: str, vocab_size: int, special_tokens: List[str]) -> Tuple[
+        Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+        """
+        Problem 3: 训练 BPE 分词器
+        """
+        print("=== Problem 3: BPE 分词器训练 ===")
+        start_time = time.time()
+        process = psutil.Process()
+        initial_memory = process.memory_info().rss / 1024 / 1024
+
+        # 1. 读取数据
+        print("1. 读取训练数据...")
+        try:
+            with open(input_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            print(f"   ✓ 读取成功: {len(text):,} 字符")
+        except FileNotFoundError:
+            print(f"   ❌ 文件不存在: {input_path}")
+            return {}, []
+
+        # 2. 初始化词汇表
+        print("2. 初始化词汇表...")
+        vocab = {}
+        merges = []
+        token_id = 0
+
+        # 添加特殊 tokens
+        for special in special_tokens:
+            vocab[token_id] = special.encode('utf-8')
+            print(f"   ✓ 添加特殊token: {special} -> ID {token_id}")
+            token_id += 1
+
+        # 添加基础字节 (0-255)
+        base_bytes_count = 0
+        for byte_val in range(256):
+            vocab[token_id] = bytes([byte_val])
+            token_id += 1
+            base_bytes_count += 1
+
+        print(f"   ✓ 添加基础字节: {base_bytes_count} 个字节 (ID {len(special_tokens)}-{token_id - 1})")
+
+        # 3. 预分词
+        print("3. 进行预分词...")
+
+        # 按特殊 token 分割文本
+        if special_tokens:
+            pattern = '|'.join(re.escape(token) for token in special_tokens)
+            chunks = re.split(f'({pattern})', text)
+        else:
+            chunks = [text]
+
+        # 收集所有单词及其频率
+        word_freq = collections.Counter()
+        special_token_count = 0
+
+        for chunk in chunks:
+            if chunk in special_tokens:
+                special_token_count += 1
+                continue  # 跳过特殊token
+
+            # 使用正则表达式分词
+            try:
+                words = re.findall(self.PAT, chunk)
+                word_freq.update(words)
+            except Exception as e:
+                print(f"   ⚠ 分词错误: {e}")
+                # 简单的回退分词
+                words = chunk.split()
+                word_freq.update(words)
+
+        print(f"   ✓ 找到 {len(word_freq):,} 个唯一单词")
+        print(f"   ✓ 找到 {special_token_count} 个特殊token")
+        if word_freq:
+            print(f"   ✓ 最常见的5个单词: {word_freq.most_common(5)}")
+
+        if not word_freq:
+            print("   ⚠ 没有找到任何单词，使用简单分词...")
+            words = text.split()
+            word_freq.update(words)
+            print(f"   ✓ 使用简单分词找到 {len(word_freq)} 个单词")
+
+        # 4. 将单词表示为字节序列
+        print("4. 准备字节序列...")
+        byte_words = {}
+        total_tokens_initial = 0
+
+        for word, freq in word_freq.items():
+            try:
+                byte_sequence = list(word.encode('utf-8'))
+                byte_tokens = [bytes([b]) for b in byte_sequence]
+                byte_words[word] = (byte_tokens, freq)
+                total_tokens_initial += len(byte_tokens) * freq
+            except Exception as e:
+                print(f"   ⚠ 跳过单词 '{word}': {e}")
+                continue
+
+        print(f"   ✓ 初始总token数: {total_tokens_initial:,}")
+        print(f"   ✓ 有效单词数: {len(byte_words)}")
+
+        if not byte_words:
+            print("   ❌ 没有有效的单词可以训练")
+            return vocab, merges
+
+        # 5. BPE 合并训练
+        print("5. 开始 BPE 合并训练...")
+        print(f"   → 目标词汇表大小: {vocab_size}")
+        print(f"   → 当前词汇表大小: {len(vocab)}")
+        print(f"   → 需要合并次数: {vocab_size - len(vocab)}")
+
+        merge_count = 0
+        max_merges = vocab_size - len(vocab)
+
+        while len(vocab) < vocab_size and merge_count < max_merges:
+            # 统计字节对频率
+            pair_freq = collections.defaultdict(int)
+            for word_data in byte_words.values():
+                tokens, freq = word_data
+                for i in range(len(tokens) - 1):
+                    pair = (tokens[i], tokens[i + 1])
+                    pair_freq[pair] += freq
+
+            if not pair_freq:
+                print("   ⚠ 没有更多可合并的字节对")
+                break
+
+            # 找到最频繁的对（处理平局：频率相同选字典序更大的）
+            best_pair = max(pair_freq.items(), key=lambda x: (x[1], x[0]))[0]
+            best_freq = pair_freq[best_pair]
+
+            if best_freq < 2:
+                print(f"   ⚠ 最频繁对频率 < 2，停止训练")
+                break
+
+            # 创建新 token
+            new_token = best_pair[0] + best_pair[1]
+            vocab[token_id] = new_token
+            merges.append(best_pair)
+
+            # 进度显示
+            if (merge_count + 1) % 50 == 0 or (merge_count + 1) <= 10:
+                progress = (merge_count + 1) / max_merges * 100
+                try:
+                    pair1_str = best_pair[0].decode('utf-8', errors='replace')
+                    pair2_str = best_pair[1].decode('utf-8', errors='replace')
+                    new_str = new_token.decode('utf-8', errors='replace')
+                    print(f"   ↳ 合并 {merge_count + 1:4d}/{max_merges} ({progress:5.1f}%): "
+                          f"'{pair1_str}' + '{pair2_str}' → '{new_str}' (频率: {best_freq})")
+                except:
+                    print(f"   ↳ 合并 {merge_count + 1:4d}/{max_merges} ({progress:5.1f}%): "
+                          f"{best_pair[0]} + {best_pair[1]} → {new_token} (频率: {best_freq})")
+
+            # 更新所有单词中的字节对
+            new_byte_words = {}
+            for word, (tokens, freq) in byte_words.items():
+                new_tokens = []
+                i = 0
+                while i < len(tokens):
+                    if (i < len(tokens) - 1 and
+                            tokens[i] == best_pair[0] and
+                            tokens[i + 1] == best_pair[1]):
+                        new_tokens.append(new_token)
+                        i += 2
+                    else:
+                        new_tokens.append(tokens[i])
+                        i += 1
+                new_byte_words[word] = (new_tokens, freq)
+
+            byte_words = new_byte_words
+            token_id += 1
+            merge_count += 1
+
+        # 6. 训练完成统计
+        training_time = time.time() - start_time
+        final_memory = process.memory_info().rss / 1024 / 1024
+        memory_usage = final_memory - initial_memory
+
+        print(f"\n🎉 BPE 训练完成!")
+        print(f"📊 训练统计:")
+        print(f"   ⏱️  训练时间: {training_time:.2f} 秒")
+        print(f"   💾 内存使用: {memory_usage:.2f} MB")
+        print(f"   📚 最终词汇表大小: {len(vocab)}")
+        print(f"   🔄 合并规则数量: {len(merges)}")
+        print(f"   📝 处理的单词数量: {len(byte_words)}")
+
+        # 分析词汇表
+        self._analyze_vocabulary(vocab)
+
+        return vocab, merges
+
+    def _analyze_vocabulary(self, vocab: Dict[int, bytes]):
+        """分析词汇表"""
+        print(f"\n📈 词汇表分析:")
+
+        if not vocab:
+            print("   词汇表为空")
+            return
+
+        # 按token长度分组
+        length_groups = {}
+        for token_bytes in vocab.values():
+            length = len(token_bytes)
+            if length not in length_groups:
+                length_groups[length] = []
+            length_groups[length].append(token_bytes)
+
+        print(f"   Token长度分布:")
+        for length in sorted(length_groups.keys()):
+            tokens = length_groups[length]
+            percentage = (len(tokens) / len(vocab)) * 100
+            print(f"     长度 {length}: {len(tokens):4d} tokens ({percentage:5.1f}%)")
+
+        # 找到最长的token
+        longest_token = max(vocab.values(), key=len)
+        max_length = len(longest_token)
+
+        # 找到所有最长的token
+        longest_tokens = [token for token in vocab.values() if len(token) == max_length]
+
+        print(f"   最长的token (长度 {max_length}):")
+        for i, token_bytes in enumerate(longest_tokens[:3]):  # 显示前3个
+            try:
+                decoded = token_bytes.decode('utf-8', errors='replace')
+                print(f"     {i + 1}. {token_bytes} -> '{decoded}'")
+            except:
+                print(f"     {i + 1}. {token_bytes} -> [无法解码]")
+
+        # 显示一些有意义的合并
+        print(f"\n   有意义的合并示例:")
+        meaningful_tokens = []
+        for token_bytes in vocab.values():
+            if len(token_bytes) > 1:
+                try:
+                    decoded = token_bytes.decode('utf-8', errors='replace')
+                    if any(c.isalpha() for c in decoded) and len(decoded) > 1:
+                        meaningful_tokens.append((token_bytes, decoded))
+                    if len(meaningful_tokens) >= 10:
+                        break
+                except:
+                    pass
+
+        for token_bytes, decoded in meaningful_tokens:
+            print(f"     {token_bytes} -> '{decoded}'")
+
+
+def run_train_bpe(input_path: str, vocab_size: int, special_tokens: List[str]) -> Tuple[
+    Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+    """
+    Problem 3: BPE训练适配器函数
+    """
+    trainer = BPETrainer()
+    return trainer.train_bpe(input_path, vocab_size, special_tokens)
+
+
+# Problem 4 的具体实现
+def problem_4_tinystories():
+    """
+    Problem 4: 在 TinyStories 上训练 BPE
+    """
+    print("\n" + "=" * 60)
+    print("PROBLEM 4: 在 TinyStories 上训练 BPE")
+    print("=" * 60)
+
+    # 配置参数
+    input_path = "TinyStoriesV2-GPT4-valid.txt"  # 根据实际路径调整
+    vocab_size = 5000
+    special_tokens = ["<|endoftext|>"]
+
+    print(f"(a) 训练配置:")
+    print(f"   数据集: {input_path}")
+    print(f"   词汇表大小: {vocab_size}")
+    print(f"   特殊token: {special_tokens}")
+
+    if not os.path.exists(input_path):
+        print(f"❌ 数据文件不存在: {input_path}")
+        print("请下载 TinyStoriesV2-GPT4-valid.txt 到当前目录")
+        return None, None
+
+    # 性能分析
+    print(f"\n(b) 开始性能分析...")
+
+    def train_with_profiling():
+        trainer = BPETrainer()
+        return trainer.train_bpe(input_path, vocab_size, special_tokens)
+
+    # 使用 cProfile 进行性能分析
+    profiler = cProfile.Profile()
+    profiler.enable()
+
+    start_time = time.time()
+    vocab, merges = train_with_profiling()
+    total_time = time.time() - start_time
+
+    profiler.disable()
+
+    # 输出性能分析结果
+    print(f"\n📊 性能分析结果 (最耗时的10个函数):")
+    stats = pstats.Stats(profiler)
+    stats.sort_stats('cumulative')
+    stats.print_stats(10)
+
+    # Problem 4 答案总结
+    print(f"\n" + "=" * 60)
+    print("PROBLEM 4 答案总结:")
+    print("=" * 60)
+    print(f"(a) 训练结果:")
+    print(f"   - 训练时间: {total_time:.2f} 秒")
+    print(f"   - 内存占用: 见上方训练统计")
+
+    if vocab:
+        longest_token = max(vocab.values(), key=len)
+        try:
+            longest_decoded = longest_token.decode('utf-8', errors='replace')
+            print(f"   - 最长token: {longest_token} -> '{longest_decoded}' (长度: {len(longest_token)} 字节)")
+        except:
+            print(f"   - 最长token: {longest_token} (长度: {len(longest_token)} 字节)")
+
+    print(f"\n(b) 性能分析:")
+    print(f"   - 最耗时的部分通常是: 字节对频率统计和合并操作")
+    print(f"   - 建议优化: 使用增量更新而不是重新计算频率")
+    print(f"   - 预分词阶段也可能成为瓶颈")
+
+    return vocab, merges
+
+
+if __name__ == "__main__":
+    # 测试 Problem 3
+    print("测试 Problem 3 的小规模训练...")
+
+    # 创建测试数据 (使用作业中的示例)
+    test_data = """low low low low low
+lower lower 
+widest widest widest
+newest newest newest newest newest newest"""
+
+    with open("test_data.txt", "w", encoding="utf-8") as f:
+        f.write(test_data)
+
+    # 运行小规模训练测试
+    print("使用示例数据训练...")
+    test_vocab, test_merges = run_train_bpe(
+        input_path="test_data.txt",
+        vocab_size=50,  # 小词汇表用于测试
+        special_tokens=["<|endoftext|>"]
+    )
+
+    print(f"\n测试训练结果:")
+    print(f"词汇表大小: {len(test_vocab)}")
+    print(f"合并规则数量: {len(test_merges)}")
+    if test_merges:
+        print(f"前5个合并规则:")
+        for i, merge in enumerate(test_merges[:5]):
+            try:
+                pair1 = merge[0].decode('utf-8', errors='replace')
+                pair2 = merge[1].decode('utf-8', errors='replace')
+                print(f"  {i + 1}. {merge[0]} + {merge[1]} -> '{pair1}{pair2}'")
+            except:
+                print(f"  {i + 1}. {merge[0]} + {merge[1]}")
+
+    # 运行 Problem 4 (如果数据文件存在)
+    print("\n" + "=" * 60)
+    if os.path.exists("TinyStoriesV2-GPT4-valid.txt"):
+        problem_4_tinystories()
+    else:
+        print(f"未找到 TinyStories 数据文件，跳过 Problem 4")
+        print(f"请将 TinyStoriesV2-GPT4-valid.txt 放在当前目录")
